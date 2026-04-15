@@ -1208,6 +1208,7 @@ endif()
 # For CUDA we also build and ship some external projects.
 if (VLLM_GPU_LANG STREQUAL "CUDA")
     include(cmake/external_projects/flashmla.cmake)
+    include(cmake/external_projects/cutlass_fa3.cmake)
     include(cmake/external_projects/qutlass.cmake)
 
     # vllm-flash-attn should be last as it overwrites some CMake functions
