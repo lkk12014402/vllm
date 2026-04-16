@@ -71,14 +71,12 @@ class FlashAttentionBackend(AttentionBackend):
         "bfloat16",
     ]
 
-    # Maximum page sizes (block_size) supported by the XPU paged-decode
-    # Maximum page_size supported by the XPU paged-decode kernel in the
-    # FA kernel in vllm_xpu_kernels. The compiled templates cover
-    # page_size=64, page_size=128, and page_size=512.
-    XPU_MAX_FA_PAGE_SIZE: ClassVar[int] = 512
-
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        if current_platform.is_xpu():
+            # XPU FA paged-decode kernels are compiled for fixed page sizes.
+            # Block splitting handles larger manager block_sizes automatically.
+            return [64, 128]
         vllm_config = get_current_vllm_config()
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
@@ -95,8 +93,6 @@ class FlashAttentionBackend(AttentionBackend):
             # suffer from the NaN propagation problem described here:
             # https://github.com/Dao-AILab/flash-attention/issues/1974
             return [16, 32, 64]
-        if current_platform.is_xpu():
-            return [64, 128, 512]
         return [MultipleOf(16)]
 
     forward_includes_kv_cache_update: bool = False
