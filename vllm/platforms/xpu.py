@@ -251,33 +251,92 @@ class XPUPlatform(Platform):
                 kernel_block_size = 64
                 break
 
-        if kernel_block_size is None:
-            return
-        new_block_size = (
-            cdiv(cache_config.block_size, kernel_block_size) * kernel_block_size
-        )
-        if new_block_size == cache_config.block_size:
-            return
+        if kernel_block_size is not None:
+            new_block_size = (
+                cdiv(cache_config.block_size, kernel_block_size) * kernel_block_size
+            )
+            if new_block_size != cache_config.block_size:
+                if cache_config.mamba_cache_mode == "align":
+                    cache_config.mamba_block_size = new_block_size
+                original_mamba_page_size_padded = cache_config.mamba_page_size_padded
+                if cache_config.mamba_page_size_padded is not None:
+                    attn_page_size_1_token = (
+                        cache_config.mamba_page_size_padded // cache_config.block_size
+                    )
+                    cache_config.mamba_page_size_padded = (
+                        new_block_size * attn_page_size_1_token
+                    )
+                cache_config.block_size = new_block_size
+                logger.info(
+                    "[XPU]Setting attention block size to %d tokens "
+                    "to ensure multiple of %d, "
+                    "set mamba_page_size_padded to %d bytes accordingly, "
+                    "before was %d bytes.",
+                    new_block_size,
+                    kernel_block_size,
+                    cache_config.mamba_page_size_padded,
+                    original_mamba_page_size_padded,
+                )
 
-        if cache_config.mamba_cache_mode == "align":
-            cache_config.mamba_block_size = new_block_size
-        original_mamba_page_size_padded = cache_config.mamba_page_size_padded
-        if cache_config.mamba_page_size_padded is not None:
-            attn_page_size_1_token = (
-                cache_config.mamba_page_size_padded // cache_config.block_size
+        # Round up block_size to the nearest FA-supported page_size when
+        # using FlashAttention. The XPU FA decode kernel only supports
+        # specific page_sizes (powers of 2). After GDN alignment the
+        # block_size may not be one of them (e.g., 320), so we bump it
+        # to the next supported value (e.g., 512).
+        backend_cls = cls._find_non_ssm_backend(vllm_config)
+        if backend_cls is not None:
+            from vllm.v1.attention.backends.flash_attn import (
+                FlashAttentionBackend,
             )
-            cache_config.mamba_page_size_padded = (
-                new_block_size * attn_page_size_1_token
-            )
-        cache_config.block_size = new_block_size
-        logger.info(
-            "[XPU]Setting attention block size to %d tokens to ensure multiple of %d, "
-            "set mamba_page_size_padded to %d bytes accordingly, before was %d bytes.",
-            new_block_size,
-            kernel_block_size,
-            cache_config.mamba_page_size_padded,
-            original_mamba_page_size_padded,
-        )
+
+            if issubclass(backend_cls, FlashAttentionBackend):
+                supported_sizes = sorted(
+                    s
+                    for s in FlashAttentionBackend.get_supported_kernel_block_sizes()
+                    if isinstance(s, int)
+                )
+                cur = cache_config.block_size
+                fa_block_size = None
+                for s in supported_sizes:
+                    if s >= cur:
+                        fa_block_size = s
+                        break
+
+                if fa_block_size is None:
+                    max_page_size = supported_sizes[-1] if supported_sizes else 0
+                    raise ValueError(
+                        f"Hybrid model requires "
+                        f"block_size={cache_config.block_size} "
+                        f"to align mamba state with attention page size, "
+                        f"but the XPU flash attention kernel "
+                        f"(vllm_xpu_kernels) only supports page_size up "
+                        f"to {max_page_size}. "
+                        f"This is a limitation of the compiled XPU FA "
+                        f"decode kernel templates. To resolve this, "
+                        f"either use --attention-backend TRITON_ATTN, "
+                        f"or rebuild vllm_xpu_kernels with support for "
+                        f"larger page sizes (e.g., "
+                        f"page_size={cache_config.block_size})."
+                    )
+
+                if fa_block_size != cur:
+                    original_mamba_psp = cache_config.mamba_page_size_padded
+                    if cache_config.mamba_page_size_padded is not None:
+                        per_token = cache_config.mamba_page_size_padded // cur
+                        cache_config.mamba_page_size_padded = fa_block_size * per_token
+                    if cache_config.mamba_cache_mode == "align":
+                        cache_config.mamba_block_size = fa_block_size
+                    cache_config.block_size = fa_block_size
+                    logger.info(
+                        "[XPU]Rounding block_size %d → %d to match "
+                        "XPU FA supported page sizes %s, "
+                        "mamba_page_size_padded %s → %d bytes.",
+                        cur,
+                        fa_block_size,
+                        supported_sizes,
+                        original_mamba_psp,
+                        cache_config.mamba_page_size_padded,
+                    )
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:

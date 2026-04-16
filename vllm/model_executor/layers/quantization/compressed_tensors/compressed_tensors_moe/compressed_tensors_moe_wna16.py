@@ -25,6 +25,11 @@ from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
 
+# TopK values supported by vllm_xpu_kernels._moe_C.remap_hidden_states.
+# The XPU kernel is compiled with template specializations only for these
+# values. Models with other TopK values fall back to the Triton MoE path.
+_XPU_SUPPORTED_MOE_TOPK = frozenset({1, 2, 4, 6, 8, 10})
+
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
     def __init__(
@@ -218,6 +223,25 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         prepare_finalize: mk.FusedMoEPrepareAndFinalizeModular,
         layer: torch.nn.Module,
     ) -> mk.FusedMoEExpertsModular:
+        from vllm.platforms import current_platform
+
+        if current_platform.is_xpu():
+            if self.moe.experts_per_token in _XPU_SUPPORTED_MOE_TOPK:
+                from vllm.model_executor.layers.fused_moe import (
+                    XPUExpertsWNA16,
+                )
+
+                assert self.moe_quant_config is not None
+                return XPUExpertsWNA16(
+                    moe_config=self.moe, quant_config=self.moe_quant_config
+                )
+            else:
+                logger.info_once(
+                    "XPU native MoE kernel does not support TopK=%d. "
+                    "Falling back to Triton WNA16 MoE.",
+                    self.moe.experts_per_token,
+                )
+
         if self.moe.is_lora_enabled:
             assert self.moe_quant_config is not None
             from vllm.triton_utils import HAS_TRITON
@@ -236,6 +260,25 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                     "Install triton or disable LoRA for MoE."
                 )
 
+        # XPU with unsupported TopK also uses Triton WNA16
+        if current_platform.is_xpu():
+            assert self.moe_quant_config is not None
+            from vllm.triton_utils import HAS_TRITON
+
+            if HAS_TRITON:
+                from vllm.model_executor.layers.fused_moe import TritonWNA16Experts
+
+                layer.w13_weight = layer.w13_weight_packed
+                layer.w2_weight = layer.w2_weight_packed
+                return TritonWNA16Experts(
+                    moe_config=self.moe, quant_config=self.moe_quant_config
+                )
+            else:
+                raise NotImplementedError(
+                    "TritonExperts requires Triton for XPU WNA16 MoE "
+                    f"with TopK={self.moe.experts_per_token}."
+                )
+
         raise NotImplementedError
 
     def apply(
@@ -246,6 +289,14 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
+        from vllm.platforms import current_platform
+
+        if (
+            current_platform.is_xpu()
+            and self.moe.experts_per_token in _XPU_SUPPORTED_MOE_TOPK
+        ):
+            return self._apply_xpu(layer, x, topk_weights, topk_ids)
+
         from vllm.model_executor.layers.fused_moe import fused_experts
 
         return fused_experts(
@@ -261,6 +312,37 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             expert_map=layer.expert_map,
             quant_config=self.moe_quant_config,
         )
+
+    def _apply_xpu(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        from vllm_xpu_kernels.fused_moe_interface import xpu_fused_moe
+
+        output = torch.empty_like(x)
+        xpu_fused_moe(
+            hidden_states=x,
+            w13=layer.w13_weight_packed,
+            w13_scales=layer.w13_weight_scale,
+            w13_bias=None,
+            w2=layer.w2_weight_packed,
+            w2_scales=layer.w2_weight_scale,
+            w2_bias=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            n_experts_per_token=topk_ids.size(1),
+            activation=layer.activation.value,
+            num_experts=layer.local_num_experts,
+            ep_rank=layer.moe_parallel_config.ep_rank,
+            ep_size=layer.moe_parallel_config.ep_size,
+            expert_map=layer.expert_map,
+            output=output,
+            is_int4=True,
+        )
+        return output
 
     @property
     def supports_eplb(self) -> bool:

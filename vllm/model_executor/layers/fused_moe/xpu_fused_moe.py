@@ -160,6 +160,79 @@ class XPUExpertsFp8(XPUExperts):
         self.is_fp8 = True
 
 
+class XPUExpertsWNA16(XPUExperts):
+    """XPU native experts for W4A16 (INT4 weight, FP16/BF16 activation) MoE."""
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        max_num_tokens: int | None = None,
+        num_dispatchers: int | None = None,
+    ):
+        super().__init__(
+            moe_config,
+            quant_config,
+            max_num_tokens,
+            num_dispatchers,
+        )
+        self.is_int4 = True
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        # W4A16: int4 weights with unquantized activations.
+        # The QuantKey for int4 is not pre-defined as a constant like FP8,
+        # so we check the dtype directly.
+        if activation_key is not None:
+            return False
+        if weight_key is None:
+            return False
+        return weight_key.dtype == torch.uint8 and not weight_key.symmetric
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ):
+        topk = topk_ids.size(-1)
+        xpu_fused_moe(
+            hidden_states=hidden_states,
+            w13=w1,
+            w13_scales=self.w1_scale,
+            w13_bias=self.w1_bias,
+            w2=w2,
+            w2_scales=self.w2_scale,
+            w2_bias=self.w2_bias,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            n_experts_per_token=topk,
+            activation=activation.value,
+            num_experts=self.moe_config.num_local_experts,
+            ep_rank=self.moe_config.ep_rank,
+            ep_size=self.moe_config.ep_size,
+            output=output,
+            is_fp8=False,
+            is_int4=True,
+            is_mxfp4=False,
+        )
+
+
 class XPUExpertsMXFp4(XPUExperts):
     def __init__(
         self,
