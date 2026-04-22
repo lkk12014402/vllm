@@ -3,6 +3,8 @@
 
 from typing import Any
 
+import torch
+
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -30,12 +32,17 @@ elif current_platform.is_xpu():
     _xpu_flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func
 
     def flash_attn_varlen_func(*args: Any, **kwargs: Any) -> Any:  # type: ignore[no-redef,misc]
-        # XPU kernel requires k_descale/v_descale to be 0-dim scalar
-        # tensors, but callers may pass 1-element 1-D tensors.
+        # XPU kernel requires descale tensors to satisfy:
+        #   sum(stride()) == 0  AND  dtype == float32
+        # Callers may pass expanded multi-element tensors (per-head scales)
+        # or 1-D single-element tensors that violate this.
+        # Reduce any non-conforming tensor to a 0-dim float32 scalar.
         for key in ("k_descale", "v_descale"):
             val = kwargs.get(key)
-            if val is not None and val.ndim != 0:
-                kwargs[key] = val.view(())
+            if val is not None and not (
+                sum(val.stride()) == 0 and val.dtype == torch.float32
+            ):
+                kwargs[key] = val.float().max().view(())
         return _xpu_flash_attn_varlen_func(*args, **kwargs)
 
     get_scheduler_metadata = xpu_ops.get_scheduler_metadata  # type: ignore[assignment]
