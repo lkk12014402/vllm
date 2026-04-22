@@ -27,7 +27,17 @@ elif current_platform.is_xpu():
     from vllm._xpu_ops import xpu_ops
 
     reshape_and_cache_flash = ops.reshape_and_cache_flash
-    flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func  # type: ignore[assignment]
+    _xpu_flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func
+
+    def flash_attn_varlen_func(*args: Any, **kwargs: Any) -> Any:  # type: ignore[no-redef,misc]
+        # XPU kernel requires k_descale/v_descale to be 0-dim scalar
+        # tensors, but callers may pass 1-element 1-D tensors.
+        for key in ("k_descale", "v_descale"):
+            val = kwargs.get(key)
+            if val is not None and val.ndim != 0:
+                kwargs[key] = val.view(())
+        return _xpu_flash_attn_varlen_func(*args, **kwargs)
+
     get_scheduler_metadata = xpu_ops.get_scheduler_metadata  # type: ignore[assignment]
 elif current_platform.is_rocm():
     try:

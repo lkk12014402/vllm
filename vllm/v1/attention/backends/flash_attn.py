@@ -73,6 +73,10 @@ class FlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        if current_platform.is_xpu():
+            # XPU FA paged-decode kernels are compiled for fixed page sizes.
+            # Block splitting handles larger manager block_sizes automatically.
+            return [64, 128]
         vllm_config = get_current_vllm_config()
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config

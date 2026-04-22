@@ -9,6 +9,11 @@ import torch
 from torch.nn.parameter import Parameter
 
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear import (
+    MPLinearKernel,
+    MPLinearLayerConfig,
+    choose_mp_linear_kernel,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -18,6 +23,7 @@ from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     QuantizationMethods,
 )
+from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Method
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
@@ -413,11 +419,19 @@ class INCConfig(QuantizationConfig):
         return None
 
     def apply_xpu_w4a16_quant_layer(self, layer, prefix: str):
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
 
         if not self.check_quantized(weight_bits):
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
+            elif isinstance(layer, FusedMoE):
+                from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (  # noqa: E501
+                    UnquantizedFusedMoEMethod,
+                )
+
+                return UnquantizedFusedMoEMethod(layer.moe_config)
             else:
                 return None
 
@@ -430,6 +444,22 @@ class INCConfig(QuantizationConfig):
             raise NotImplementedError(
                 "INC W4A16 on XPU only supports symmetric quantization for now."
             )
+
+        if isinstance(layer, FusedMoE):
+            from vllm.model_executor.layers.quantization.moe_wna16 import (
+                MoeWNA16Config,
+            )
+
+            config = {
+                "quant_method": "gptq",
+                "bits": weight_bits,
+                "group_size": group_size,
+                "sym": sym,
+                "lm_head": False,
+            }
+            moe_config = MoeWNA16Config.from_config(config)
+            return INCXPUMoEMethod(moe_config, layer.moe_config)
+
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             return INCXPULinearMethod(
                 weight_bits=weight_bits,
@@ -495,23 +525,23 @@ class INCConfig(QuantizationConfig):
 
 
 class INCXPULinearMethod(LinearMethodBase):
-    """XPU linear method for INC w4a16 GPTQ quantization (symmetric only).
+    """XPU linear method for INC W4A16 quantization (symmetric only).
 
-    Repacks GPTQ weights from [in_packed, out] to oneDNN [out, in_packed]
-    layout and calls torch.ops._xpu_C.int4_gemm_w4a16.
-
-    GPTQ format: qweight [in_packed, out] with sequential nibble order.
-
-    Note: Asymmetric quantization (sym=false) is not for now.
-
-    FIXME(yiliu30): Refine the implementation to reuse XPUwNa16LinearKernel.
+    Loads GPTQ-format checkpoint weights and delegates compute to the
+    XPUwNa16LinearKernel via the MPLinearKernel framework.  The GPTQ
+    parameter names and [K_packed, N] layout are remapped to the
+    kernel-expected names (weight_packed, weight_scale, …) and
+    [N, K_packed] layout during process_weights_after_loading.
     """
+
+    _kernel_backends_being_used: set[str] = set()
 
     def __init__(self, weight_bits: int, group_size: int, sym: bool):
         self.weight_bits = weight_bits
         self.group_size = group_size
         self.sym = sym
         self.pack_factor = 32 // weight_bits
+        self.kernel: MPLinearKernel | None = None
 
     def create_weights(
         self,
@@ -523,11 +553,11 @@ class INCXPULinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        del output_size  # Unused.
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
         scales_and_zp_size = input_size_per_partition // self.group_size
 
+        # --- Register GPTQ checkpoint parameters ---
         # GPTQ: qweight [in // pack_factor, out] packed along input dim
         qweight = PackedvLLMParameter(
             data=torch.empty(
@@ -565,13 +595,7 @@ class INCXPULinearMethod(LinearMethodBase):
             packed_factor=self.pack_factor,
             weight_loader=weight_loader,
         )
-
-        layer.register_parameter("qweight", qweight)
-        layer.register_parameter("scales", scales)
-        layer.register_parameter("qzeros", qzeros)
-
         # GPTQ checkpoints may include g_idx for activation reordering.
-        # Register it so the weight loader doesn't error on unexpected keys.
         g_idx = RowvLLMParameter(
             data=torch.tensor(
                 [i // self.group_size for i in range(input_size_per_partition)],
@@ -580,30 +604,60 @@ class INCXPULinearMethod(LinearMethodBase):
             input_dim=0,
             weight_loader=weight_loader,
         )
+
+        layer.register_parameter("qweight", qweight)
+        layer.register_parameter("scales", scales)
+        layer.register_parameter("qzeros", qzeros)
         layer.register_parameter("g_idx", g_idx)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Repack GPTQ weights into kernel-ready NT layout."""
-        device = layer.qweight.data.device
-
-        # oneDNN int4 kernel requires strides[0]==1 ("NT format"), but GPTQ
-        # checkpoint is [K_packed, N] contiguous with strides (N, 1).
-        # Two transposes are needed — neither alone can achieve this:
-        #   1. .t().contiguous() → [N, K_packed] contiguous in memory
-        #   2. .t()              → [K_packed, N] view with strides (1, K_packed)
-        # The result has the same logical shape but strides[0]==1 as required.
-        qweight_ct = layer.qweight.data.t().contiguous()
-        layer.qweight = Parameter(qweight_ct.t(), requires_grad=False)
-
-        # Scales: [num_groups, out] — no change needed
-        layer.scales = Parameter(layer.scales.data, requires_grad=False)
-
-        # Symmetric: GPTQ v1 stores qzeros=7, effective zp = 7+1 = 8
-        # Kernel expects int8 scalar = 8
-        layer.qzeros = Parameter(
-            torch.tensor([8], dtype=torch.int8, device=device),
-            requires_grad=False,
+        # --- Select and instantiate kernel ---
+        quant_type = scalar_types.uint4b8
+        mp_config = MPLinearLayerConfig(
+            full_weight_shape=(input_size, output_size),
+            partition_weight_shape=(
+                input_size_per_partition,
+                output_size_per_partition,
+            ),
+            weight_type=quant_type,
+            act_type=params_dtype,
+            group_size=self.group_size,
+            zero_points=not self.sym,
+            has_g_idx=False,
         )
+
+        kernel_type = choose_mp_linear_kernel(mp_config)
+        if kernel_type.__name__ not in self._kernel_backends_being_used:
+            logger.info("Using %s for INC XPU W4A16", kernel_type.__name__)
+            self._kernel_backends_being_used.add(kernel_type.__name__)
+
+        # Use the hardcoded names that XPUwNa16LinearKernel expects
+        self.kernel = kernel_type(
+            mp_config,
+            w_q_param_name="weight_packed",
+            w_s_param_name="weight_scale",
+            w_zp_param_name="weight_zero_point",
+            w_gidx_param_name="g_idx",
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Remap GPTQ params to kernel-expected names/layout and delegate."""
+        # qweight [K_packed, N] → weight_packed [N, K_packed]
+        layer.weight_packed = Parameter(
+            layer.qweight.data.t().contiguous(), requires_grad=False
+        )
+        # scales [num_groups, N] → weight_scale [N, num_groups]
+        # (kernel transposes back to [num_groups, N] internally)
+        layer.weight_scale = Parameter(
+            layer.scales.data.t().contiguous(), requires_grad=False
+        )
+
+        # Remove GPTQ params that have been remapped
+        layer.register_parameter("qweight", None)
+        layer.register_parameter("scales", None)
+        layer.register_parameter("qzeros", None)
+
+        # Delegate to kernel (creates scalar zp, clears g_idx)
+        self.kernel.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -611,17 +665,101 @@ class INCXPULinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # qweight is already in NT layout [K_packed, N] (strides (1, K_packed))
-        # from process_weights_after_loading — pass directly to kernel.
-        out_shape = x.shape[:-1] + (layer.qweight.shape[1],)
-        reshaped_x = x.reshape(-1, x.shape[-1])
-        out = torch.ops._xpu_C.int4_gemm_w4a16(
-            reshaped_x,
-            layer.qweight,
-            bias,
-            layer.scales,
-            layer.qzeros,
-            self.group_size,
-            None,  # g_idx not needed: desc_act is always False for INC models
-        )
+        out_shape = x.shape[:-1] + (layer.weight_packed.shape[0],)
+        out = self.kernel.apply_weights(layer, x, bias)
         return out.reshape(out_shape)
+
+
+# TopK values supported by vllm_xpu_kernels._moe_C.remap_hidden_states.
+_XPU_SUPPORTED_MOE_TOPK = frozenset({1, 2, 4, 6, 8, 10})
+
+
+class INCXPUMoEMethod(MoeWNA16Method):
+    """INC W4A16 MoE on XPU using native XPU fused MoE kernel.
+
+    Inherits GPTQ-format weight creation/loading from MoeWNA16Method.
+    Overrides apply to use the native XPU fused MoE kernel for supported
+    TopK values, falling back to the Triton path otherwise.
+    """
+
+    def select_gemm_impl(
+        self,
+        prepare_finalize,
+        layer: torch.nn.Module,
+    ):
+        if self.moe.experts_per_token in _XPU_SUPPORTED_MOE_TOPK:
+            from vllm.model_executor.layers.fused_moe import XPUExpertsWNA16
+
+            assert self.moe_quant_config is not None
+            return XPUExpertsWNA16(
+                moe_config=self.moe, quant_config=self.moe_quant_config
+            )
+
+        # Unsupported TopK — fall back to Triton WNA16
+        logger.info_once(
+            "XPU native MoE kernel does not support TopK=%d. "
+            "Falling back to Triton WNA16 MoE.",
+            self.moe.experts_per_token,
+        )
+        assert self.moe_quant_config is not None
+        from vllm.triton_utils import HAS_TRITON
+
+        if HAS_TRITON:
+            from vllm.model_executor.layers.fused_moe import TritonWNA16Experts
+
+            layer.w13_weight = layer.w13_qweight
+            layer.w2_weight = layer.w2_qweight
+            return TritonWNA16Experts(
+                moe_config=self.moe, quant_config=self.moe_quant_config
+            )
+
+        raise NotImplementedError(
+            "TritonExperts requires Triton for INC XPU WNA16 MoE "
+            f"with TopK={self.moe.experts_per_token}."
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        topk = topk_ids.size(1)
+        if topk in _XPU_SUPPORTED_MOE_TOPK:
+            return self._apply_xpu(layer, x, topk_weights, topk_ids)
+        # Fallback to generic fused_experts (Triton)
+        return super().apply(layer, x, topk_weights, topk_ids,
+                             shared_experts_input)
+
+    def _apply_xpu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        from vllm_xpu_kernels.fused_moe_interface import xpu_fused_moe
+
+        output = torch.empty_like(x)
+        xpu_fused_moe(
+            hidden_states=x,
+            w13=layer.w13_qweight,
+            w13_scales=layer.w13_scales,
+            w13_bias=None,
+            w2=layer.w2_qweight,
+            w2_scales=layer.w2_scales,
+            w2_bias=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            n_experts_per_token=topk_ids.size(1),
+            activation=layer.activation.value,
+            num_experts=layer.local_num_experts,
+            ep_rank=layer.moe_parallel_config.ep_rank,
+            ep_size=layer.moe_parallel_config.ep_size,
+            expert_map=layer.expert_map,
+            output=output,
+            is_int4=True,
+        )
+        return output
