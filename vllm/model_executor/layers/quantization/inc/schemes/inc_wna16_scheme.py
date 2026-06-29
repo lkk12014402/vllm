@@ -218,25 +218,24 @@ def _resolve_awq_moe(layer: "torch.nn.Module", layer_config: "INCLayerConfig"):
 def _resolve_xpu_moe(layer: "torch.nn.Module", layer_config: "INCLayerConfig"):
     """Build a symmetric int4 group WNA16 MoE method backed by XPUExpertsWNA16.
 
-    Reuses ``CompressedTensorsWNA16MarlinMoEMethod`` whose oracle selects the
-    XPU backend (``xpu_fused_moe(is_int4=True)``) on Intel XPU. AutoRound stores
-    GPTQ-packed nibbles, matching the weight layout that backend expects.
+    AutoRound saves expert weights with GPTQ suffixes
+    (``qweight`` / ``scales`` / ``qzeros`` / ``g_idx``).
+    :class:`INCXPUWNA16MoEMethod` subclasses :class:`MoeWNA16Method`, so it
+    registers exactly those parameter names and repacks them into the uint8
+    ``[E, 2N, K // 2]`` layout expected by ``xpu_fused_moe(is_int4=True)``,
+    while routing compute through the native XPU kernel.
     """
-    from compressed_tensors.quantization import (
-        QuantizationArgs,
-        QuantizationStrategy,
-        QuantizationType,
-    )
+    from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16_marlin import (  # noqa: E501
-        CompressedTensorsWNA16MarlinMoEMethod,
-    )
+    from ..inc_xpu_moe import INCXPUWNA16MoEMethod
 
-    weight_quant = QuantizationArgs(
-        num_bits=layer_config.bits,
-        type=QuantizationType.INT,
-        symmetric=layer_config.sym,
-        group_size=layer_config.group_size,
-        strategy=QuantizationStrategy.GROUP,
+    moe_config = MoeWNA16Config.from_config(
+        {
+            "quant_method": "gptq",
+            "bits": layer_config.bits,
+            "group_size": layer_config.group_size,
+            "sym": layer_config.sym,
+            "lm_head": False,
+        }
     )
-    return CompressedTensorsWNA16MarlinMoEMethod(weight_quant, None, layer.moe_config)
+    return INCXPUWNA16MoEMethod(moe_config, layer.moe_config)

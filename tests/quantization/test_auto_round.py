@@ -595,22 +595,12 @@ def test_mxfp4_moe_not_supported() -> None:
         )
 
 
-def test_wna16_xpu_moe_gptq_sym_int4_uses_ct_marlin(monkeypatch) -> None:
+def test_wna16_xpu_moe_gptq_sym_int4_uses_native_xpu(monkeypatch) -> None:
     monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
     monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
 
-    captured = {}
-
-    class DummyMethod:
-        def __init__(self, weight_quant, input_quant, moe):
-            captured["weight_quant"] = weight_quant
-            captured["moe"] = moe
-
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.compressed_tensors."
-        "compressed_tensors_moe.compressed_tensors_moe_wna16_marlin."
-        "CompressedTensorsWNA16MarlinMoEMethod",
-        DummyMethod,
+    from vllm.model_executor.layers.quantization.inc.inc_xpu_moe import (
+        INCXPUWNA16MoEMethod,
     )
 
     layer = DummyFusedMoE()
@@ -622,10 +612,13 @@ def test_wna16_xpu_moe_gptq_sym_int4_uses_ct_marlin(monkeypatch) -> None:
         make_layer_config(group_size=32),
     )
 
-    assert isinstance(method, DummyMethod)
-    assert captured["weight_quant"].num_bits == 4
-    assert captured["weight_quant"].group_size == 32
-    assert captured["moe"] is layer.moe_config
+    assert isinstance(method, INCXPUWNA16MoEMethod)
+    # GPTQ-named uint8 layout inherited from MoeWNA16Method.
+    assert method.quant_config.weight_bits == 4
+    assert method.quant_config.group_size == 32
+    assert method.quant_config.has_zp is False
+    assert method.quant_config.linear_quant_method == "gptq"
+    assert method.moe is layer.moe_config
 
 
 def test_wna16_xpu_moe_unsupported_falls_back_to_unquantized(monkeypatch) -> None:
