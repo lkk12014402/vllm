@@ -39,7 +39,6 @@ class INCConfig(QuantizationConfig):
     SUPPORTED_FORMATS = {
         "auto_round:auto_gptq",
         "auto_round:auto_awq",
-        "auto_round:mxfp4",
     }
     SUPPORTED_BACKENDS = {
         "auto",
@@ -67,12 +66,15 @@ class INCConfig(QuantizationConfig):
                 f"Unsupported weight_bits: {weight_bits}, "
                 f"currently only support {self.SUPPORTED_BITS}."
             )
-        if data_type not in self.SUPPORTED_DTYPES:
+        # auto-round mxfp data_type is e.g. "mx_fp4" / "mx_fp4e2m1"; match the
+        # "mx_fp" family by substring like auto_round.compressors.is_mx_fp.
+        is_mxfp = "mx_fp" in data_type
+        if data_type not in self.SUPPORTED_DTYPES and not is_mxfp:
             raise ValueError(
                 f"Unsupported data_type: {data_type},"
                 f" currently only support  {self.SUPPORTED_DTYPES}."
             )
-        if packing_format not in self.SUPPORTED_FORMATS and data_type != "mx_fp":
+        if packing_format not in self.SUPPORTED_FORMATS and not is_mxfp:
             raise ValueError(
                 f"Unsupported packing_format: {packing_format}, "
                 f"currently only support {self.SUPPORTED_FORMATS}."

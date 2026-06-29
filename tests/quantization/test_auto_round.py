@@ -97,6 +97,16 @@ def make_config(**overrides) -> INCConfig:
     return INCConfig(**kwargs)
 
 
+def make_mxfp4_config(**overrides) -> INCConfig:
+    kwargs = {
+        "data_type": "mx_fp",
+        "packing_format": "auto_round:llm_compressor",
+        "group_size": 32,
+    }
+    kwargs.update(overrides)
+    return make_config(**kwargs)
+
+
 def make_layer_config(**overrides) -> INCLayerConfig:
     kwargs = {
         "bits": 4,
@@ -257,18 +267,31 @@ def test_inc_config_parser_fused_module_requires_consistent_configs() -> None:
 
 
 def test_inc_layer_config_mx_fp_helpers() -> None:
+    # auto_round writes data_type="mx_fp4" (not "mx_fp"); match by substring.
     layer_config = INCLayerConfig(
         bits=4,
         group_size=32,
         sym=True,
-        packing_format="",
+        packing_format="autoround:exllamav2",
         backend="",
-        data_type="mx_fp",
+        data_type="mx_fp4",
         quantized=True,
     )
 
     assert layer_config.is_mxfp4 is True
     assert layer_config.is_mxfp8 is False
+
+    mxfp8 = INCLayerConfig(
+        bits=8,
+        group_size=32,
+        sym=True,
+        packing_format="autoround:exllamav2",
+        backend="",
+        data_type="mx_fp8e4m3",
+        quantized=True,
+    )
+    assert mxfp8.is_mxfp4 is False
+    assert mxfp8.is_mxfp8 is True
 
 
 def test_inc_resolve_scheme_selects_wna16() -> None:
@@ -536,7 +559,7 @@ def make_mxfp4_layer_config(**overrides) -> INCLayerConfig:
         "bits": 4,
         "group_size": 32,
         "sym": True,
-        "packing_format": "auto_round:mxfp4",
+        "packing_format": "auto_round:llm_compressor",
         "backend": "auto",
         "data_type": "mx_fp",
         "quantized": True,
@@ -554,7 +577,7 @@ def test_mxfp4_linear_non_xpu_raises(monkeypatch) -> None:
     monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
     with pytest.raises(NotImplementedError, match="only supported on XPU"):
         INCMxfp4Scheme().get_linear_method(
-            make_config(data_type="mx_fp", group_size=32),
+            make_mxfp4_config(),
             object(),
             "layer",
             make_mxfp4_layer_config(),
@@ -570,7 +593,7 @@ def test_mxfp4_linear_xpu_builds_method(monkeypatch) -> None:
     )
 
     method = INCMxfp4Scheme().get_linear_method(
-        make_config(data_type="mx_fp", group_size=32),
+        make_mxfp4_config(),
         object(),
         "layer",
         make_mxfp4_layer_config(),
@@ -588,7 +611,7 @@ def test_mxfp4_linear_xpu_builds_method(monkeypatch) -> None:
 def test_mxfp4_moe_not_supported() -> None:
     with pytest.raises(NotImplementedError, match="does not support MoE"):
         INCMxfp4Scheme().get_moe_method(
-            make_config(data_type="mx_fp", group_size=32),
+            make_mxfp4_config(),
             object(),
             "layer",
             make_mxfp4_layer_config(),
