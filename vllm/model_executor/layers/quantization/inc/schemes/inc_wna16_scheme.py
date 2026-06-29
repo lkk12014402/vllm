@@ -88,8 +88,22 @@ class INCWna16Scheme(INCScheme):
         layer_config: "INCLayerConfig",
     ):
         del config, prefix
-        # XPU and CPU do not support MoE quantization yet
-        if current_platform.is_xpu() or current_platform.is_cpu():
+        # XPU: gptq-symmetric int4 group MoE is backed by XPUExpertsWNA16.
+        if current_platform.is_xpu():
+            if (
+                layer_config.is_gptq
+                and layer_config.bits == 4
+                and layer_config.sym
+                and layer_config.group_size > 0
+            ):
+                return _resolve_xpu_moe(layer, layer_config)
+            from vllm.model_executor.layers.fused_moe import (
+                UnquantizedFusedMoEMethod,
+            )
+
+            return UnquantizedFusedMoEMethod(layer.moe_config)
+        # CPU does not support quantized MoE yet
+        if current_platform.is_cpu():
             from vllm.model_executor.layers.fused_moe import (
                 UnquantizedFusedMoEMethod,
             )
@@ -199,3 +213,30 @@ def _resolve_awq_moe(layer: "torch.nn.Module", layer_config: "INCLayerConfig"):
         }
     )
     return MoeWNA16Method(moe_config, layer.moe_config)
+
+
+def _resolve_xpu_moe(layer: "torch.nn.Module", layer_config: "INCLayerConfig"):
+    """Build a symmetric int4 group WNA16 MoE method backed by XPUExpertsWNA16.
+
+    Reuses ``CompressedTensorsWNA16MarlinMoEMethod`` whose oracle selects the
+    XPU backend (``xpu_fused_moe(is_int4=True)``) on Intel XPU. AutoRound stores
+    GPTQ-packed nibbles, matching the weight layout that backend expects.
+    """
+    from compressed_tensors.quantization import (
+        QuantizationArgs,
+        QuantizationStrategy,
+        QuantizationType,
+    )
+
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16_marlin import (  # noqa: E501
+        CompressedTensorsWNA16MarlinMoEMethod,
+    )
+
+    weight_quant = QuantizationArgs(
+        num_bits=layer_config.bits,
+        type=QuantizationType.INT,
+        symmetric=layer_config.sym,
+        group_size=layer_config.group_size,
+        strategy=QuantizationStrategy.GROUP,
+    )
+    return CompressedTensorsWNA16MarlinMoEMethod(weight_quant, None, layer.moe_config)

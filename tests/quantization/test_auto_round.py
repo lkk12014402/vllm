@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.layers.quantization.inc.config_parser import INCLayerConfig
 from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
 from vllm.model_executor.layers.quantization.inc.schemes import (
+    INCMxfp4Scheme,
     INCWna16Scheme,
     resolve_scheme,
 )
@@ -530,7 +531,127 @@ def test_inc_get_quant_method_moe_uses_resolved_scheme(monkeypatch) -> None:
     assert method is sentinel
 
 
-def test_resolve_gptq_moe_falls_back_to_moe_wna16(monkeypatch) -> None:
+def make_mxfp4_layer_config(**overrides) -> INCLayerConfig:
+    kwargs = {
+        "bits": 4,
+        "group_size": 32,
+        "sym": True,
+        "packing_format": "auto_round:mxfp4",
+        "backend": "auto",
+        "data_type": "mx_fp",
+        "quantized": True,
+    }
+    kwargs.update(overrides)
+    return INCLayerConfig(**kwargs)
+
+
+def test_inc_resolve_scheme_selects_mxfp4() -> None:
+    scheme = resolve_scheme(make_mxfp4_layer_config())
+    assert isinstance(scheme, INCMxfp4Scheme)
+
+
+def test_mxfp4_linear_non_xpu_raises(monkeypatch) -> None:
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+    with pytest.raises(NotImplementedError, match="only supported on XPU"):
+        INCMxfp4Scheme().get_linear_method(
+            make_config(data_type="mx_fp", group_size=32),
+            object(),
+            "layer",
+            make_mxfp4_layer_config(),
+        )
+
+
+def test_mxfp4_linear_xpu_builds_method(monkeypatch) -> None:
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.inc.schemes."
+        "inc_mxfp4_linear.init_mxfp4_linear_kernel",
+        lambda: object(),
+    )
+
+    method = INCMxfp4Scheme().get_linear_method(
+        make_config(data_type="mx_fp", group_size=32),
+        object(),
+        "layer",
+        make_mxfp4_layer_config(),
+    )
+
+    from vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_linear import (
+        INCMxfp4LinearMethod,
+    )
+
+    assert isinstance(method, INCLinearMethod)
+    assert isinstance(method.scheme, INCMxfp4LinearMethod)
+    assert method.scheme.group_size == 32
+
+
+def test_mxfp4_moe_not_supported() -> None:
+    with pytest.raises(NotImplementedError, match="does not support MoE"):
+        INCMxfp4Scheme().get_moe_method(
+            make_config(data_type="mx_fp", group_size=32),
+            object(),
+            "layer",
+            make_mxfp4_layer_config(),
+        )
+
+
+def test_wna16_xpu_moe_gptq_sym_int4_uses_ct_marlin(monkeypatch) -> None:
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+
+    captured = {}
+
+    class DummyMethod:
+        def __init__(self, weight_quant, input_quant, moe):
+            captured["weight_quant"] = weight_quant
+            captured["moe"] = moe
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors_moe.compressed_tensors_moe_wna16_marlin."
+        "CompressedTensorsWNA16MarlinMoEMethod",
+        DummyMethod,
+    )
+
+    layer = DummyFusedMoE()
+    layer.moe_config = object()
+    method = INCWna16Scheme().get_moe_method(
+        make_config(group_size=32),
+        layer,
+        "layer",
+        make_layer_config(group_size=32),
+    )
+
+    assert isinstance(method, DummyMethod)
+    assert captured["weight_quant"].num_bits == 4
+    assert captured["weight_quant"].group_size == 32
+    assert captured["moe"] is layer.moe_config
+
+
+def test_wna16_xpu_moe_unsupported_falls_back_to_unquantized(monkeypatch) -> None:
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
+
+    class DummyUnquant:
+        def __init__(self, moe_config) -> None:
+            self.moe_config = moe_config
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.UnquantizedFusedMoEMethod",
+        DummyUnquant,
+    )
+
+    layer = DummyFusedMoE()
+    layer.moe_config = object()
+    method = INCWna16Scheme().get_moe_method(
+        make_config(),
+        layer,
+        "layer",
+        make_layer_config(sym=False),
+    )
+
+    assert isinstance(method, DummyUnquant)
+
     captured = {}
 
     class DummyMoeConfig:
