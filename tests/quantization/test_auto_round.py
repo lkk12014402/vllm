@@ -608,14 +608,44 @@ def test_mxfp4_linear_xpu_builds_method(monkeypatch) -> None:
     assert method.scheme.group_size == 32
 
 
-def test_mxfp4_moe_not_supported() -> None:
-    with pytest.raises(NotImplementedError, match="does not support MoE"):
+def test_mxfp4_moe_non_xpu_raises(monkeypatch) -> None:
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+    with pytest.raises(NotImplementedError, match="MoE only supported on XPU"):
         INCMxfp4Scheme().get_moe_method(
             make_mxfp4_config(),
             object(),
             "layer",
             make_mxfp4_layer_config(),
         )
+
+
+def test_mxfp4_xpu_moe_reuses_ct_method(monkeypatch) -> None:
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+
+    captured = {}
+
+    class DummyCTMethod:
+        def __init__(self, moe):
+            captured["moe"] = moe
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4."
+        "CompressedTensorsW4A4Mxfp4MoEMethod",
+        DummyCTMethod,
+    )
+
+    layer = DummyFusedMoE()
+    layer.moe_config = object()
+    method = INCMxfp4Scheme().get_moe_method(
+        make_mxfp4_config(),
+        layer,
+        "layer",
+        make_mxfp4_layer_config(),
+    )
+
+    assert isinstance(method, DummyCTMethod)
+    assert captured["moe"] is layer.moe_config
 
 
 def test_wna16_xpu_moe_gptq_sym_int4_uses_native_xpu(monkeypatch) -> None:
