@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import inspect
 from importlib.util import find_spec
 from types import ModuleType
 from typing import Any
@@ -82,6 +83,14 @@ if find_spec("flashinfer"):
             flashinfer_comm = _flashinfer_comm
     except ImportError:
         pass
+
+# Some (patched) flashinfer builds accept a ``weight_bias`` argument on
+# ``allreduce_fusion`` that adds GemmaRMSNorm's ``(1 + weight)`` offset inside
+# the fused kernel. Stock flashinfer (e.g. 0.6.11) does not. Detect support so
+# we can fold the bias into ``rms_gamma`` instead when it is missing.
+_FI_ALLREDUCE_FUSION_SUPPORTS_WEIGHT_BIAS = flashinfer_comm is not None and (
+    "weight_bias" in inspect.signature(flashinfer_comm.allreduce_fusion).parameters
+)
 
 if hasattr(torch.ops._C, "scaled_fp4_quant"):
     STATIC_FP4_QUANT_OP = torch.ops._C.scaled_fp4_quant.out
@@ -222,6 +231,17 @@ if flashinfer_comm is not None:
             # in vllm we only support swizzled layout
             layout_code = flashinfer_comm.QuantizationSFLayout.SWIZZLED_128x4
 
+        # GemmaRMSNorm scales by ``(1 + weight)``; ``weight_bias`` (=1.0) carries
+        # that offset. Patched flashinfer applies it inside the kernel via the
+        # ``weight_bias`` arg; stock flashinfer lacks it, so fold the bias into
+        # ``rms_gamma`` (mathematically identical: ``normed * (gamma + bias)``).
+        if _FI_ALLREDUCE_FUSION_SUPPORTS_WEIGHT_BIAS:
+            weight_bias_kwargs: dict[str, Any] = {"weight_bias": weight_bias}
+        else:
+            weight_bias_kwargs = {}
+            if weight_bias != 0.0:
+                rms_gamma = rms_gamma + weight_bias
+
         flashinfer_comm.allreduce_fusion(
             input=allreduce_in,
             workspace=workspace,
@@ -239,7 +259,7 @@ if flashinfer_comm is not None:
             layout_code=layout_code,
             use_oneshot=use_oneshot,
             fp32_acc=fp32_acc,
-            weight_bias=weight_bias,
+            **weight_bias_kwargs,
             # The one-shot Lamport all-reduce signals PDL completion before its
             # output buffer is committed when trigger_completion_at_end is
             # False, so the next PDL-launched kernel can read the uninitialized

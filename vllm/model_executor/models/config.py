@@ -39,6 +39,51 @@ class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
             logger.info("Using bfloat16 kv-cache for DeepSeekV3.2")
 
 
+class MiniMaxM3Config(VerifyAndUpdateConfig):
+    @classmethod
+    def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        # MiniMax-M3 mixes dense full-attention layers (the first few, where
+        # sparse_attention_freq == 0) with block-sparse attention layers (the
+        # rest). The sparse-attention and lightning-indexer kernels only support
+        # a KV-cache page/block size equal to the model's sparse block size
+        # (`get_supported_kernel_block_sizes()` returns `[sparse_block_size]`,
+        # 128 here).
+        #
+        # The generic block-size autoselect (Platform.update_block_size_for_backend)
+        # only inspects the *first* non-SSM attention backend. For MiniMax-M3 that
+        # is a dense full-attention layer, which is happy with the default block
+        # size (16), so the block size is never bumped up to what the sparse
+        # layers require. KV-cache init then fails in select_common_block_size
+        # with "No common block size for 16.".
+        #
+        # Pin the KV-cache block size to the sparse block size so every group
+        # (dense full-attention accepts MultipleOf(16); sparse requires 128)
+        # can agree on it, and mark it user-specified so the autoselect above
+        # does not reset it back to 16.
+        hf_config = vllm_config.model_config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+        if sparse_cfg is None:
+            return
+        if isinstance(sparse_cfg, dict):
+            sparse_block_size = sparse_cfg.get("sparse_block_size")
+        else:
+            sparse_block_size = getattr(sparse_cfg, "sparse_block_size", None)
+        if not sparse_block_size:
+            return
+
+        cache_config = vllm_config.cache_config
+        if cache_config.block_size != sparse_block_size:
+            logger.info(
+                "Setting KV cache block size to %d to match MiniMax-M3 sparse "
+                "block size (was %s).",
+                sparse_block_size,
+                cache_config.block_size,
+            )
+        cache_config.block_size = sparse_block_size
+        cache_config.user_specified_block_size = True
+
+
 class Ernie4_5_VLMoeForConditionalGenerationConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -826,6 +871,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "LlamaNemotronVLModel": LlamaNemotronVLConfig,
     "Mamba2ForCausalLM": MambaModelConfig,
     "MambaForCausalLM": MambaModelConfig,
+    "MiniMaxM3SparseForCausalLM": MiniMaxM3Config,
+    "MiniMaxM3SparseForConditionalGeneration": MiniMaxM3Config,
     "NemotronHForCausalLM": NemotronHForCausalLMConfig,
     "NemotronHPuzzleForCausalLM": NemotronHForCausalLMConfig,
     "NemotronH_Nano_VL_V2": NemotronHNanoVLV2Config,
