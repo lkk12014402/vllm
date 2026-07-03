@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.layers.quantization.inc.config_parser import INCLayerConfig
 from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
 from vllm.model_executor.layers.quantization.inc.schemes import (
+    INCMxfp4Scheme,
     INCWna16Scheme,
     resolve_scheme,
 )
@@ -50,6 +51,53 @@ MODELS = [
     ),
 ]
 
+QWEN3_AUTOROUND_MODELS = [
+    pytest.param(
+        "INCModel/Qwen3-1.7B-AutoRound-MXFP4-W4A4",
+        {
+            "dtype": "bfloat16",
+            "enforce_eager": True,
+            "gpu_memory_utilization": 0.45,
+            "max_model_len": 2048,
+        },
+        "FlashInferMxFp4LinearKernel",
+        marks=pytest.mark.skipif(
+            not (current_platform.is_cuda() or current_platform.is_xpu()),
+            reason="Qwen3-1.7B MXFP4 AutoRound model requires CUDA/XPU.",
+        ),
+        id="auto_round:mxfp4:qwen3-1p7b",
+    ),
+    pytest.param(
+        "INCModel/Qwen3-30B-A3B-AutoRound-INT4-W4A16",
+        {
+            "dtype": "bfloat16",
+            "enforce_eager": True,
+            "gpu_memory_utilization": 0.9,
+            "max_model_len": 2048,
+        },
+        None,
+        marks=pytest.mark.skipif(
+            not (current_platform.is_cuda() or current_platform.is_xpu()),
+            reason="Qwen3-30B-A3B W4A16 AutoRound model requires CUDA/XPU.",
+        ),
+        id="auto_round:w4a16:qwen3-30b-a3b",
+    ),
+    pytest.param(
+        "INCModel/Qwen3-30B-A3B-AutoRound-MXFP4-W4A4",
+        {
+            "dtype": "bfloat16",
+            "enforce_eager": True,
+            "gpu_memory_utilization": 0.9,
+            "max_model_len": 2048,
+        },
+        "FlashInferMxFp4LinearKernel",
+        marks=pytest.mark.skipif(
+            not (current_platform.is_cuda() or current_platform.is_xpu()),
+            reason="Qwen3-30B-A3B MXFP4 AutoRound model requires CUDA/XPU.",
+        ),
+        id="auto_round:mxfp4:qwen3-30b-a3b",
+    ),
+]
 
 @pytest.mark.skipif(
     not (
@@ -67,6 +115,29 @@ def test_auto_round_model(vllm_runner, model):
     assert output
     print(output[0][1])
 
+
+
+@pytest.mark.parametrize(
+    ("model", "engine_kwargs", "disabled_kernel"),
+    QWEN3_AUTOROUND_MODELS,
+)
+def test_auto_round_qwen3_smoke(
+    vllm_runner,
+    monkeypatch,
+    model,
+    engine_kwargs,
+    disabled_kernel,
+):
+    if disabled_kernel is not None:
+        monkeypatch.setenv("VLLM_DISABLED_KERNELS", disabled_kernel)
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+    with vllm_runner(model, **engine_kwargs) as llm:
+        output = llm.generate_greedy(["The capital of France is"], max_tokens=8)
+
+    assert output
+    print(output[0][1])
 
 # ---------------------------------------------------------------------------
 # Unit tests for INCConfig and related classes
@@ -108,6 +179,61 @@ def make_layer_config(**overrides) -> INCLayerConfig:
     }
     kwargs.update(overrides)
     return INCLayerConfig(**kwargs)
+
+def make_qwen3_autoround_config(kind: str) -> INCConfig:
+    if kind == "qwen3_1p7b_mxfp4":
+        return INCConfig.from_config({
+            "quant_method": "auto-round",
+            "bits": 4,
+            "group_size": 32,
+            "sym": True,
+            "packing_format": "auto_round:llm_compressor",
+            "data_type": "mx_fp",
+            "extra_config": {
+                "model.layers.0.self_attn.q_proj": {
+                    "bits": 16,
+                    "data_type": "float",
+                },
+            },
+        })
+    if kind == "qwen3_30b_a3b_w4a16":
+        return INCConfig.from_config({
+            "quant_method": "auto-round",
+            "bits": 4,
+            "group_size": 32,
+            "sym": True,
+            "packing_format": "auto_round:auto_gptq",
+            "data_type": "int",
+            "extra_config": {
+                "model.layers.0.mlp.gate": {
+                    "bits": 16,
+                    "data_type": "float",
+                },
+            },
+        })
+    if kind == "qwen3_30b_a3b_mxfp4":
+        return INCConfig.from_config({
+            "quant_method": "auto-round",
+            "bits": 4,
+            "group_size": 32,
+            "sym": True,
+            "packing_format": "auto_round:llm_compressor",
+            "data_type": "mx_fp",
+            "act_bits": 4,
+            "act_group_size": 32,
+            "act_data_type": "mx_fp",
+            "extra_config": {
+                "model.layers.0.mlp.gate": {
+                    "bits": 16,
+                    "data_type": "float",
+                },
+                "model.layers.0.self_attn.q_proj": {
+                    "bits": 16,
+                    "data_type": "float",
+                },
+            },
+        })
+    raise AssertionError(f"unknown qwen3 autoround config: {kind}")
 
 
 def test_inc_config_parser_exact_match() -> None:
@@ -285,6 +411,116 @@ def test_inc_resolve_scheme_selects_wna16() -> None:
 
     assert isinstance(scheme, INCWna16Scheme)
 
+def test_qwen3_1p7b_mxfp4_autoround_uses_mxfp4_linear_scheme(
+    monkeypatch,
+) -> None:
+    class DummyKernel:
+        pass
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.inc.schemes."
+        "inc_mxfp4_linear.init_mxfp4_linear_kernel",
+        lambda: DummyKernel(),
+    )
+
+    from vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_linear import (  # noqa: E501
+        INCMxfp4LinearMethod,
+    )
+
+    config = make_qwen3_autoround_config("qwen3_1p7b_mxfp4")
+
+    assert INCConfig.override_quantization_method(
+        {"quant_method": "auto-round"}, user_quant=None
+    ) == "inc"
+    ignored_method = config.get_quant_method(
+        object.__new__(LinearBase), "model.layers.0.self_attn.q_proj"
+    )
+    layer_config = config.config_parser.resolve(
+        DummyLayer(), "model.layers.0.mlp.gate_proj"
+    )
+    method = INCMxfp4Scheme().get_linear_method(
+        config,
+        object.__new__(LinearBase),
+        "model.layers.0.mlp.gate_proj",
+        layer_config,
+    )
+
+    assert isinstance(ignored_method, UnquantizedLinearMethod)
+    assert layer_config.bits == 4
+    assert layer_config.group_size == 32
+    assert layer_config.is_mxfp4 is True
+    assert isinstance(resolve_scheme(layer_config), INCMxfp4Scheme)
+    assert isinstance(method, INCLinearMethod)
+    assert isinstance(method.scheme, INCMxfp4LinearMethod)
+    assert isinstance(method.scheme.kernel, DummyKernel)
+
+
+def test_qwen3_30b_a3b_w4a16_autoround_routes_to_gptq_moe(
+    monkeypatch,
+) -> None:
+    captured = {}
+    expected_method = object()
+
+    class DummyMoeConfig:
+        pass
+
+    def fake_resolve_gptq_moe(layer, layer_config):
+        captured["layer"] = layer
+        captured["layer_config"] = layer_config
+        return expected_method
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.inc.schemes."
+        "inc_wna16_scheme._resolve_gptq_moe",
+        fake_resolve_gptq_moe,
+    )
+
+    config = make_qwen3_autoround_config("qwen3_30b_a3b_w4a16")
+    layer = object.__new__(RoutedExperts)
+    layer.moe_config = DummyMoeConfig()
+
+    method = config.get_quant_method(layer, "model.layers.0.mlp")
+
+    assert method is expected_method
+    assert captured["layer"] is layer
+    assert captured["layer_config"].bits == 4
+    assert captured["layer_config"].group_size == 32
+    assert captured["layer_config"].is_gptq is True
+    assert captured["layer_config"].is_wna16_int is True
+
+
+def test_qwen3_30b_a3b_mxfp4_autoround_routes_to_mxfp4_moe(
+    monkeypatch,
+) -> None:
+    class DummyMoeConfig:
+        pass
+
+    class DummyMxfp4MoEMethod:
+        def __init__(self, moe_config) -> None:
+            self.moe_config = moe_config
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.inc.inc_moe.INCMxfp4MoEMethod",
+        DummyMxfp4MoEMethod,
+    )
+
+    config = make_qwen3_autoround_config("qwen3_30b_a3b_mxfp4")
+    layer = object.__new__(RoutedExperts)
+    layer.moe_config = DummyMoeConfig()
+
+    ignored_method = config.get_quant_method(
+        object.__new__(LinearBase), "model.layers.0.self_attn.q_proj"
+    )
+    method = config.get_quant_method(layer, "model.layers.0.mlp")
+    layer_config = config.config_parser.resolve(DummyLayer(), "model.layers.0.mlp")
+
+    assert isinstance(ignored_method, UnquantizedLinearMethod)
+    assert layer_config.bits == 4
+    assert layer_config.group_size == 32
+    assert layer_config.is_mxfp4 is True
+    assert isinstance(resolve_scheme(layer_config), INCMxfp4Scheme)
+    assert isinstance(method, DummyMxfp4MoEMethod)
+    assert method.moe_config is layer.moe_config
 
 class DummyLinearScheme(INCLinearScheme):
     def __init__(self) -> None:
