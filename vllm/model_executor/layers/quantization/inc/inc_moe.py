@@ -70,10 +70,6 @@ class INCXPUWNA16MoEMethod(MoeWNA16Method):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        if shared_experts is not None:
-            raise NotImplementedError(
-                "INCXPUWNA16MoEMethod does not support fused shared experts."
-            )
 
         experts = self._get_xpu_experts()
         output = torch.empty_like(x)
