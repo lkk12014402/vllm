@@ -824,6 +824,9 @@ def run_cutlass_moe_mxfp4(
     e: int,
     device: torch.device,
     apply_router_weight_on_input: bool = False,
+    gemm1_clamp_limit: float | None = None,
+    gemm1_alpha: float = 1.0,
+    gemm1_beta: float = 0.0,
 ) -> None:
     """MXFP4 x MXFP4 MoE implementation using CUTLASS grouped GEMM."""
     is_gated = activation.is_gated
@@ -910,7 +913,14 @@ def run_cutlass_moe_mxfp4(
             c1, expert_offsets, blockscale_offsets, e, num_topk
         )
     else:
-        apply_moe_activation(activation, c2, c1)
+        apply_moe_activation(
+            activation,
+            c2,
+            c1,
+            clamp_limit=gemm1_clamp_limit,
+            alpha=gemm1_alpha,
+            beta=gemm1_beta,
+        )
         int_fp4, int_blockscale = ops.mxfp4_experts_quant(
             c2, expert_offsets, blockscale_offsets, e, num_topk
         )
@@ -1021,6 +1031,7 @@ class CutlassExpertsMxfp4(mk.FusedMoEExpertsModular):
             MoEActivation.SILU,
             MoEActivation.GELU,
             MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
             MoEActivation.SWIGLUSTEP,
             MoEActivation.SILU_NO_MUL,
             MoEActivation.GELU_NO_MUL,
@@ -1098,6 +1109,17 @@ class CutlassExpertsMxfp4(mk.FusedMoEExpertsModular):
             e=e,
             device=hidden_states.device,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            gemm1_clamp_limit=self.quant_config.gemm1_clamp_limit,
+            gemm1_alpha=(
+                self.quant_config.gemm1_alpha
+                if self.quant_config.gemm1_alpha is not None
+                else 1.0
+            ),
+            gemm1_beta=(
+                self.quant_config.gemm1_beta
+                if self.quant_config.gemm1_beta is not None
+                else 0.0
+            ),
         )
 
 

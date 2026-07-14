@@ -132,10 +132,16 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
         if self.use_cutlass_mxfp4:
-            # W4A4: both weights and activations quantized to MXFP4
+            # W4A4: both weights and activations quantized to MXFP4.
+            # Forward the model's clamped SwiGLU-OAI params (present for
+            # activations like MiniMax-M3's swigluoai_uninterleave) so the
+            # cutlass activation kernel can apply silu_and_mul_with_clamp.
             return mxfp4_moe_quant_config(
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
+                gemm1_alpha=getattr(layer, "swiglu_alpha", None),
+                gemm1_beta=getattr(layer, "swiglu_beta", None),
+                gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
             )
         else:
             # W4A16: weight-only via Marlin
